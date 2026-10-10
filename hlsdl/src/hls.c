@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <assert.h>
 #include <limits.h>
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -986,6 +987,21 @@ static uint8_t *ff_avc_find_startcode(uint8_t *p, uint8_t *end){
     return out;
 }
 
+/* SAMPLE-AES restarts the CBC chain for every NAL unit / audio frame. One
+ * cipher context, re-initialised each time, instead of allocating and freeing
+ * one per frame. Used from the downloading thread only; lives until exit. */
+static void *sample_aes_ctx(void)
+{
+    static void *ctx = NULL;
+    if (!ctx) {
+        ctx = AES128_CBC_CTX_new();
+        if (!ctx) {
+            MSG_ERROR("out of memory\n");
+        }
+    }
+    return ctx;
+}
+
 static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in, int size)
 {
     uint8_t *end = buf_in + size;
@@ -1005,16 +1021,15 @@ static int sample_aes_decrypt_nal_units(hls_media_segment_t *s, uint8_t *buf_in,
         int nal_unit_type = *nal_start & 0x1F;
         int nal_size = nal_end - nal_start;
         // NAL unit with length of 48 bytes or fewer is completely unencrypted.
-        if ((nal_unit_type == 1 || nal_unit_type == 5) && nal_size > 48) {
+        void *ctx = sample_aes_ctx();
+        if ((nal_unit_type == 1 || nal_unit_type == 5) && nal_size > 48 && ctx) {
             uint8_t* nal_start_bkup = nal_start;
             nal_start += 32;
-            void *ctx = AES128_CBC_CTX_new();
             AES128_CBC_DecryptInit(ctx, s->enc_aes.key_value, s->enc_aes.iv_value, false);
             while (nal_start + 16 < nal_end) {
                 AES128_CBC_DecryptUpdate(ctx, nal_start, nal_start, 16);
                 nal_start += 16 * 10; // Each 16-byte block of encrypted data is followed by up to nine 16-byte blocks of unencrypted data.
             }
-            AES128_CBC_free(ctx);
             nal_start = nal_start_bkup;
         }
         int bytes_inserted = 0;
@@ -1085,11 +1100,10 @@ static int sample_aes_decrypt_audio_data(hls_media_segment_t *s, uint8_t *ptr, u
         }
 
         int tmp_size = frame_length > leaderSize ? (frame_length - leaderSize) & 0xFFFFFFF0  : 0;
-        if (tmp_size) {
-            void *ctx = AES128_CBC_CTX_new();
+        void *ctx = sample_aes_ctx();
+        if (tmp_size && ctx) {
             AES128_CBC_DecryptInit(ctx, s->enc_aes.key_value, s->enc_aes.iv_value, false);
             AES128_CBC_DecryptUpdate(ctx, audio_frame + leaderSize, audio_frame + leaderSize, tmp_size);
-            AES128_CBC_free(ctx);
         }
 
         audio_frame += frame_length;
@@ -1411,10 +1425,17 @@ static void *hls_playlist_update_thread(void *arg)
     while (!is_endlist) {
         // download live hls can interrupt waiting
         ts.tv_sec =  time(NULL) + refresh_delay_s;
+        bool stop = false;
         pthread_mutex_lock(media_playlist_mtx);
         pthread_cleanup_push(unlock_media_playlist_mtx, media_playlist_mtx);
-        pthread_cond_timedwait(media_playlist_refresh_cond, media_playlist_mtx, &ts);
+        if (!updater_params->stop) {
+            pthread_cond_timedwait(media_playlist_refresh_cond, media_playlist_mtx, &ts);
+        }
+        stop = updater_params->stop;
         pthread_cleanup_pop(1);   /* unlock; also runs if cancelled in the wait */
+        if (stop) {
+            break;
+        }
 
         // update playlist
         hls_media_playlist_t new_me;
@@ -1683,7 +1704,145 @@ static void written_map_free(written_map_t *w)
     memset(w, 0, sizeof(*w));
 }
 
-int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
+/* Where merge_packets() takes an audio segment from: packed audio (raw
+ * AAC / AC-3 behind an ID3 tag with the timestamp) as it is - merge_packets()
+ * packs it into TS itself, and looking for TS packets in it would find none,
+ * so the audio was dropped - and a TS segment from its first packet. */
+static uint8_t *audio_merge_start(ByteBuffer_t *seg)
+{
+    if (seg->len >= 10 && 0 == memcmp(seg->data, "ID3", 3)) {
+        /* An ID3 tag can also sit in front of a TS segment (timed
+         * metadata) - only raw audio behind the tag is packed audio. The
+         * tag size is syncsafe (7 bits per byte), a footer adds 10 bytes. */
+        const uint8_t *d = seg->data;
+        size_t tag = 10 + (((size_t)(d[6] & 0x7f) << 21) | ((size_t)(d[7] & 0x7f) << 14)
+                         | ((size_t)(d[8] & 0x7f) << 7) | (size_t)(d[9] & 0x7f));
+        if (d[5] & 0x10) {
+            tag += 10;
+        }
+        if (tag < (size_t)seg->len && seg->data[tag] == TS_SYNC_BYTE
+            && consecutive_sync_byte(seg->data + tag, (size_t)seg->len - tag, 3)) {
+            return seg->data + tag;
+        }
+        return seg->data;
+    }
+    return find_first_ts_packet(seg);
+}
+
+/* Live audio rendition (EXT-X-MEDIA TYPE=AUDIO, or -a): consecutive audio
+ * segments that could not be had before the audio track is given up and the
+ * video goes on alone. Waiting for and fetching the audio of one segment
+ * share one deadline (audio_wait_sec): an audio CDN that is down must not
+ * hold up the video until the live window has moved on. */
+#define LIVE_AUDIO_MAX_MISSES 3
+
+static void unlink_queue_head(hls_media_playlist_t *pl)
+{
+    struct hls_media_segment *head = pl->first_media_segment;
+    pl->first_media_segment = head->next;
+    if (pl->first_media_segment) {
+        pl->first_media_segment->prev = NULL;
+    } else {
+        /* the refresh thread appends through last_media_segment */
+        pl->last_media_segment = NULL;
+    }
+    head->next = NULL;
+}
+
+/* Takes the audio segment with media sequence number seq off the audio queue,
+ * dropping older ones and audio init segments on the way. NULL when it is
+ * already gone or does not show up before the deadline (the playlist refresh
+ * is asked for while waiting). Called without the mutex held. */
+static struct hls_media_segment *live_take_audio(hls_media_playlist_t *ma, int seq, pthread_mutex_t *mtx,
+                                                 pthread_cond_t *refresh_cond, pthread_cond_t *empty_cond, time_t deadline)
+{
+    struct hls_media_segment *found = NULL;
+    struct timespec ts;
+    memset(&ts, 0x00, sizeof(ts));
+    ts.tv_sec = deadline;
+
+    pthread_mutex_lock(mtx);
+    while (true) {
+        struct hls_media_segment *as = ma->first_media_segment;
+        if (as) {
+            if (as->is_map || as->sequence_number < seq) {
+                unlink_queue_head(ma);
+                media_segment_cleanup(as);
+                continue;
+            }
+            if (as->sequence_number == seq) {
+                unlink_queue_head(ma);
+                found = as;
+            }
+            break;   /* found it, or it is already gone */
+        }
+        if (ma->is_endlist) {
+            break;
+        }
+        pthread_cond_broadcast(refresh_cond);
+        if (ETIMEDOUT == pthread_cond_timedwait(empty_cond, mtx, &ts)) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(mtx);
+    return found;
+}
+
+/* Fetches and decrypts one live audio segment - the video waits meanwhile, so
+ * a failed transfer is retried only while the deadline leaves time for it.
+ * 0: seg holds the plaintext. */
+static int live_fetch_audio(void **psession, struct hls_media_segment *as, struct ByteBuffer *seg, time_t deadline)
+{
+    int tries = 0;
+    while (true) {
+        memset(seg, 0x00, sizeof(*seg));
+        size_t size = 0;
+        long http_code = get_data_from_url_with_session(psession, as->url, (char **)&(seg->data), &size, BINARY, NULL, as->offset, as->size);
+        seg->len = (int)size;
+        bool http_ok = http_code == 200 || (http_code == 206 && (as->size > -1 || hls_args.accept_partial_content));
+        if (http_ok && size > 0 && !unusable_segment_response(as, http_code, size)) {
+            if (tries) {
+                set_fresh_connect_http_session(*psession, 0);
+            }
+            bool failed = (as->encryptiontype == ENC_AES128 && 0 != decrypt_aes128(as, seg));
+            if (!failed) {
+                strip_disguise_prefix(seg);
+                failed = (as->encryptiontype == ENC_AES_SAMPLE && 1 == decrypt_sample_aes(as, seg));
+            }
+            if (!failed) {
+                return 0;
+            }
+            free(seg->data);
+            seg->data = NULL;
+            return 1;
+        }
+        free(seg->data);
+        seg->data = NULL;
+        if (http_ok || http_code == 403 || http_code == 401 || http_code == 410
+            || tries >= 2 || time(NULL) + 2 > deadline) {
+            MSG_WARNING("Live mode skipping audio segment %d. http_code[%d].\n", as->sequence_number, (int)http_code);
+            return 1;
+        }
+        clean_http_session(*psession);
+        sleep(1);
+        *psession = init_hls_session();
+        set_timeout_session(*psession, 2L, 5L);
+        set_fresh_connect_http_session(*psession, 1);
+        tries += 1;
+    }
+}
+
+/* Ends a live updater thread started with stop = false. */
+static void stop_updater_thread(hls_playlist_updater_params *params, pthread_t thread)
+{
+    pthread_mutex_lock((pthread_mutex_t *)params->media_playlist_mtx);
+    params->stop = true;
+    pthread_cond_broadcast((pthread_cond_t *)params->media_playlist_refresh_cond);
+    pthread_mutex_unlock((pthread_mutex_t *)params->media_playlist_mtx);
+    pthread_join(thread, NULL);
+}
+
+int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio)
 {
     MSG_API("{\"d_t\":\"live\"}\n");
 
@@ -1770,6 +1929,53 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
         me->total_duration_ms = get_duration_hls_media_playlist(me);
     }
 
+    /* Separate audio rendition: its own refresh thread on the same mutex and
+     * conditions, its segments paired with the video ones by media sequence
+     * number and muxed in like the VOD path does (TS only). Renditions of one
+     * stream normally share the numbering. The two playlists were fetched one
+     * after the other, so their windows may be a segment or so apart - that
+     * is no reason to shift the pairing (it would put every segment one
+     * segment out of sync); only windows that do not overlap at all are taken
+     * as numbered apart, and their live edges are lined up instead. */
+    bool audio_on = me_audio && me_audio->first_media_segment;
+    hls_playlist_updater_params audio_params;
+    pthread_t audio_thread;
+    int audio_seq_offset = 0;
+    int audio_misses = 0;
+    int audio_wait_sec = 0;
+    void *audio_session = NULL;
+    merge_context_t live_merge;
+    memset(&audio_params, 0x00, sizeof(audio_params));
+    memset(&live_merge, 0x00, sizeof(live_merge));
+    if (audio_on) {
+        if (me->last_media_sequence < me_audio->first_media_sequence
+            || me_audio->last_media_sequence < me->first_media_sequence) {
+            audio_seq_offset = me_audio->last_media_sequence - me->last_media_sequence;
+            MSG_VERBOSE("Audio playlist numbered apart from the video - offset %d.\n", audio_seq_offset);
+        }
+        audio_wait_sec = 2 * (int)(me_audio->target_duration_ms / 1000) + 2;
+        if (audio_wait_sec < 4) {
+            audio_wait_sec = 4;
+        } else if (audio_wait_sec > 30) {
+            audio_wait_sec = 30;
+        }
+        live_merge.out = out_ctx;
+        audio_params.media_playlist = me_audio;
+        audio_params.media_playlist_mtx = (void *)&media_playlist_mtx;
+        audio_params.media_playlist_refresh_cond = (void *)&media_playlist_refresh_cond;
+        audio_params.media_playlist_empty_cond   = (void *)&media_playlist_empty_cond;
+        audio_session = init_hls_session();
+        set_timeout_session(audio_session, 2L, 3L);
+        if (0 != pthread_create(&audio_thread, NULL, hls_playlist_update_thread, &audio_params)) {
+            MSG_WARNING("Could not start the audio playlist refresh - writing the video only.\n");
+            audio_on = false;
+        }
+    }
+    bool audio_thread_running = audio_on;
+    /* a discontinuity was crossed since the last merge - kept until the next
+     * merge, also when the flagged segment itself is skipped */
+    bool merge_reset_pending = false;
+
     // start update thread
     pthread_t thread;
     void *ret;
@@ -1807,13 +2013,18 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
         }
         if (ms == NULL) {
             if (download) {
-                pthread_cond_signal(&media_playlist_refresh_cond);
+                /* broadcast: the audio refresh thread waits on it too */
+                pthread_cond_broadcast(&media_playlist_refresh_cond);
                 pthread_cond_wait(&media_playlist_empty_cond, &media_playlist_mtx);
             }
         }
         pthread_mutex_unlock(&media_playlist_mtx);
         if (ms == NULL) {
             continue;
+        }
+
+        if (ms->discontinuity) {
+            merge_reset_pending = true;
         }
 
         int retries = 0;
@@ -1895,6 +2106,13 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 break;
             }
 
+            if (audio_on && me->media_type == MEDIA_TYPE_FMP4) {
+                MSG_WARNING("Separate audio track with fragmented MP4 - hlsdl writes the video track only; use a remuxer for muxed output.\n");
+                audio_on = false;
+                stop_updater_thread(&audio_params, audio_thread);
+                audio_thread_running = false;
+            }
+
             if (ms->encryptiontype == ENC_AES_SAMPLE && 1 == decrypt_sample_aes(ms, &seg)) {
                 MSG_WARNING("Live mode skipping segment %d - it could not be decrypted.\n", ms->sequence_number);
                 free(seg.data);
@@ -1916,8 +2134,50 @@ int download_live_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me)
                 break;
             }
 
-            size_t written = out_ctx->write(seg.data, seg.len, out_ctx->opaque);
-            download_size += written;
+            /* the audio of this segment, muxed into its TS packets */
+            size_t merged = 0;
+            if (audio_on && !ms->is_map) {
+                time_t audio_deadline = time(NULL) + audio_wait_sec;
+                struct hls_media_segment *as = live_take_audio(me_audio, ms->sequence_number + audio_seq_offset,
+                                                               &media_playlist_mtx, &media_playlist_refresh_cond,
+                                                               &media_playlist_empty_cond, audio_deadline);
+                struct ByteBuffer seg_audio;
+                memset(&seg_audio, 0x00, sizeof(seg_audio));
+                /* new PIDs / PMT after a discontinuity (ad break): the merge
+                 * works out its PMT again (also when this segment ends up
+                 * without audio - the next merge then starts afresh) */
+                if (merge_reset_pending || (as && as->discontinuity)) {
+                    merge_context_reset(&live_merge);
+                    merge_reset_pending = false;
+                }
+                if (as && 0 == live_fetch_audio(&audio_session, as, &seg_audio, audio_deadline)) {
+                    uint8_t *v = find_first_ts_packet(&seg);
+                    uint8_t *a = audio_merge_start(&seg_audio);
+                    if (v && a) {
+                        merged = merge_packets(&live_merge, v, (uint32_t)(seg.len - (v - seg.data)),
+                                               a, (uint32_t)(seg_audio.len - (a - seg_audio.data)));
+                    }
+                }
+                free(seg_audio.data);
+                media_segment_cleanup(as);
+
+                if (merged) {
+                    audio_misses = 0;
+                } else {
+                    MSG_WARNING("No audio for segment %d - writing the video only.\n", ms->sequence_number);
+                    if (++audio_misses >= LIVE_AUDIO_MAX_MISSES) {
+                        MSG_WARNING("The audio track keeps failing - going on with the video only.\n");
+                        audio_on = false;
+                        stop_updater_thread(&audio_params, audio_thread);
+                        audio_thread_running = false;
+                    }
+                }
+            }
+
+            /* merge_packets() does not tell a short write apart; a full
+             * disk then shows up with the next video-only write or at close */
+            size_t written = merged ? (size_t)seg.len : out_ctx->write(seg.data, seg.len, out_ctx->opaque);
+            download_size += merged ? merged : written;
             if (ms->is_map && written == (size_t)seg.len) {
                 written_map_set(&written_map, ms, &seg);
             }
@@ -1947,6 +2207,21 @@ loop_cleanup:
     }
 
     written_map_free(&written_map);
+
+    if (audio_thread_running) {
+        stop_updater_thread(&audio_params, audio_thread);
+    }
+    if (me_audio) {
+        /* what the audio refresh queued after the last video segment */
+        while (me_audio->first_media_segment) {
+            struct hls_media_segment *as = me_audio->first_media_segment;
+            unlink_queue_head(me_audio);
+            media_segment_cleanup(as);
+        }
+    }
+    if (audio_session) {
+        clean_http_session(audio_session);
+    }
 
     pthread_join(thread, &ret);
     pthread_mutex_destroy(&media_playlist_mtx);
@@ -2160,6 +2435,9 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
     int skipped_segments = 0;   /* -I */
     int written_segments = 0;
     written_map_t written_map = {0};
+    /* a discontinuity was crossed since the last A/V merge - kept until the
+     * next merge, also when -I skips the flagged segment */
+    bool merge_reset_pending = false;
 
     if (me_audio) {
         ms_audio = me_audio->first_media_segment;
@@ -2270,6 +2548,9 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
             continue;
         }
 
+        if (ms->discontinuity || (ms_audio && ms_audio->discontinuity)) {
+            merge_reset_pending = true;
+        }
         int seg_ret = vod_download_segment(&session, me, ms, &seg);
         if (0 != seg_ret) {
             if (seg_ret == VOD_SEG_DOWNLOAD_ERROR && hls_args.ignore_download_errors) {
@@ -2341,7 +2622,7 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
                 ret = 1;
                 break;
             }
-            first_audio_packet = find_first_ts_packet(&seg_audio);
+            first_audio_packet = audio_merge_start(&seg_audio);
         }
 
         // first segment should be TS for success merge
@@ -2349,6 +2630,12 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
             size_t video_len = seg.len - (first_video_packet - seg.data);
             size_t audio_len = seg_audio.len - (first_audio_packet - seg_audio.data);
 
+            /* the PIDs / PMT may have changed at the discontinuity: the merge
+             * works its PMT out again */
+            if (merge_reset_pending) {
+                merge_context_reset(&merge_context);
+                merge_reset_pending = false;
+            }
             size_t merged = merge_packets(
                 &merge_context,
                 first_video_packet,
@@ -2357,9 +2644,17 @@ int download_hls(write_ctx_t *out_ctx, hls_media_playlist_t *me, hls_media_playl
                 audio_len
             );
             download_size += merged;
-            /* 0 = no PMT to merge or nothing could be written - the segment
-             * would silently be missing from the file */
-            if (!merged) {
+            if (!merged && first_audio_packet == seg_audio.data && !memcmp(seg_audio.data, "ID3", 3)) {
+                /* packed audio hlsdl cannot pack (no timestamp in the ID3
+                 * tag, unknown codec): the video goes in alone, as it always
+                 * did before packed audio was merged */
+                MSG_WARNING("Could not merge the packed audio of segment %d - writing the video only.\n", ms->sequence_number);
+                if (!vod_write(out_ctx, seg.data, seg.len, &download_size)) {
+                    ret = 1;
+                }
+            } else if (!merged) {
+                /* 0 = no PMT to merge or nothing could be written - the
+                 * segment would silently be missing from the file */
                 MSG_ERROR("Could not merge audio and video of segment %d.\n", ms->sequence_number);
                 MSG_API("{\"error_code\":-1, \"error_msg\":\"merge\"}\n");
                 ret = 1;
@@ -2496,34 +2791,67 @@ void master_playlist_cleanup(struct hls_master_playlist *ma)
     free(ma->url);
 }
 
+/* Keys fetched so far, by key URL. Several entries, because a separate audio
+ * rendition usually has a key of its own: with a single entry the video and
+ * the audio key pushed each other out and every segment cost a key request.
+ * Replaced round robin. Used from the downloading thread only. */
+#define KEY_CACHE_SIZE 8
+
+static struct {
+    char *url;
+    uint8_t value[KEYLEN];
+} key_cache[KEY_CACHE_SIZE];
+static int key_cache_next = 0;
+/* kept between key requests, so a key costs no new TCP / TLS handshake */
+static void *key_session = NULL;
+
+static void key_cache_put(const char *url, const uint8_t *value)
+{
+    char *copy = strdup(url);
+    if (!copy) {
+        return;
+    }
+    free(key_cache[key_cache_next].url);
+    key_cache[key_cache_next].url = copy;
+    memcpy(key_cache[key_cache_next].value, value, KEYLEN);
+    key_cache_next = (key_cache_next + 1) % KEY_CACHE_SIZE;
+}
+
+static bool key_cache_get(const char *url, uint8_t *value)
+{
+    for (int i = 0; i < KEY_CACHE_SIZE; i++) {
+        if (key_cache[i].url && 0 == strcmp(key_cache[i].url, url)) {
+            memcpy(value, key_cache[i].value, KEYLEN);
+            return true;
+        }
+    }
+    return false;
+}
+
+void fill_key_value_cleanup(void)
+{
+    for (int i = 0; i < KEY_CACHE_SIZE; i++) {
+        free(key_cache[i].url);
+        key_cache[i].url = NULL;
+    }
+    if (key_session) {
+        clean_http_session(key_session);
+        key_session = NULL;
+    }
+}
+
 int fill_key_value(struct enc_aes128 *es)
 {
-    /* temporary we will create cache with keys url here
-     * this will make this function thread unsafe but at now
-     * it is not problem because it is used only from one thread
-     *
-     * last allocation of cache_key_url will not be free
-     * but this is not big problem since this code is run
-     * as standalone process
-     *(system will free all memory allocated by process at it exit).
-     *
-     * But this must be fixed for clear valgrind memory leak detection.
-     */
-    static char cache_key_value[KEYLEN] = "";
-    static char *cache_key_url = NULL;
-
     if (es && es->key_url)
     {
-        if (cache_key_url && 0 == strcmp(cache_key_url, es->key_url))
+        if (key_cache_get(es->key_url, es->key_value))
         {
-            memcpy(es->key_value, cache_key_value, KEYLEN);
+            /* known key */
         }
         else if (hls_args.key_value)
         {
             memcpy(es->key_value, hls_args.key_value, KEYLEN);
-            memcpy(cache_key_value, es->key_value, KEYLEN);
-            free(cache_key_url);
-            cache_key_url = strdup(es->key_url);
+            key_cache_put(es->key_url, es->key_value);
         } else
         {
             char *key_url = NULL;
@@ -2539,7 +2867,11 @@ int fill_key_value(struct enc_aes128 *es)
                 key_url = es->key_url;
             }
 
-            http_code = get_hls_data_from_url(key_url, &key_value, &size, BINKEY, NULL);
+            if (!key_session) {
+                key_session = init_hls_session();
+                set_timeout_session(key_session, 2L, 15L);
+            }
+            http_code = get_data_from_url_with_session(&key_session, key_url, &key_value, &size, BINKEY, NULL, -1, -1);
             if (es->key_url != key_url) {
                 free(key_url);
             }
@@ -2547,6 +2879,9 @@ int fill_key_value(struct enc_aes128 *es)
             if (http_code != 200) {
                 MSG_ERROR("Getting key-file [%s] failed http_code[%d].\n", es->key_url, (int)http_code);
                 free(key_value);
+                /* the next attempt starts on a fresh connection */
+                clean_http_session(key_session);
+                key_session = NULL;
                 return 1;
             }
 
@@ -2559,9 +2894,7 @@ int fill_key_value(struct enc_aes128 *es)
             memcpy(es->key_value, key_value, KEYLEN);
             free(key_value);
 
-            free(cache_key_url);
-            cache_key_url = strdup(es->key_url);
-            memcpy(cache_key_value, es->key_value, KEYLEN);
+            key_cache_put(es->key_url, es->key_value);
         }
 
         free(es->key_url);

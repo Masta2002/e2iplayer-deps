@@ -99,13 +99,14 @@ typedef struct hls_playlist_updater_params {
     void *media_playlist_mtx;
     void *media_playlist_refresh_cond;
     void *media_playlist_empty_cond;
+    bool stop;   /* set under media_playlist_mtx: the thread ends at its next wake-up */
 } hls_playlist_updater_params;
 
 
 int get_playlist_type(char *source);
 int handle_hls_master_playlist(struct hls_master_playlist *ma);
 int handle_hls_media_playlist(hls_media_playlist_t *me);
-int download_live_hls(write_ctx_t *ctx, hls_media_playlist_t *me);
+int download_live_hls(write_ctx_t *ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio);
 bool consecutive_sync_byte(uint8_t *buf, size_t len, uint8_t n);
 uint8_t * find_first_ts_packet(ByteBuffer_t *buf);
 int download_hls(write_ctx_t *ctx, hls_media_playlist_t *me, hls_media_playlist_t *me_audio, hls_resume_state_t *resume);
@@ -116,6 +117,7 @@ void master_playlist_cleanup(struct hls_master_playlist *ma);
 void media_segment_cleanup(struct hls_media_segment *ms);
 void add_media_segment(hls_media_playlist_t *me);
 int fill_key_value(struct enc_aes128 *es);
+void fill_key_value_cleanup(void);
 
 long get_hls_data_from_url(char *url, char **out, size_t *size, int type, char **new_url);
 

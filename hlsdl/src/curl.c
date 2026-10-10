@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <errno.h>
 #include <pthread.h>
 #include <curl/curl.h>
@@ -39,39 +40,57 @@ void * set_timeout_session(void *ptr_session, const long speed_limit, const long
     return session;
 }
 
+/* first allocation when the server sends no Content-Length (chunked live
+ * segments, compressed playlists) */
+#define RECV_BUF_MIN (64 * 1024)
+/* connecting gets this long; curl's own default is 300 s, which with the
+ * segment retries left a dead CDN hanging the download for a long time */
+#define CONNECT_TIMEOUT_SEC 15L
+
 static size_t
 WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
 {
     size_t realsize = size * nmemb;
     struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
+    /* mem->reserved = bytes allocated, the NUL terminator included */
     if (mem->reserved == 0)
     {
         CURLcode res;
         double filesize = 0.0;
 
         res = curl_easy_getinfo(mem->c, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &filesize);
-        if((CURLE_OK == res) && (filesize>0.0))
+        /* more than a segment can hold (INT_MAX, see hls.c) is not trusted */
+        if ((CURLE_OK == res) && (filesize > 0.0) && (filesize < (double)INT_MAX))
         {
-            char *tmp = realloc(mem->memory, (int)filesize + 2);
+            size_t want = (size_t)filesize + 1;
+            char *tmp = realloc(mem->memory, want);
             if (tmp == NULL) {
                 MSG_ERROR("not enough memory (realloc returned NULL)\n");
                 return 0;
             }
             mem->memory = tmp;
-            mem->reserved = (int)filesize + 1;
+            mem->reserved = want;
         }
     }
 
     if ((mem->size + realsize + 1) > mem->reserved)
     {
-        char *tmp = realloc(mem->memory, mem->size + realsize + 1);
+        /* Grow geometrically: without a Content-Length (or with the smaller
+         * compressed one) every chunk curl hands over would otherwise mean a
+         * realloc and, often, a copy of everything received so far. */
+        size_t need = mem->size + realsize + 1;
+        size_t want = mem->reserved < RECV_BUF_MIN ? RECV_BUF_MIN : mem->reserved * 2;
+        if (want < need) {
+            want = need;
+        }
+        char *tmp = realloc(mem->memory, want);
         if (tmp == NULL) {
             MSG_ERROR("not enough memory (realloc returned NULL)\n");
             return 0;
         }
         mem->memory = tmp;
-        mem->reserved = mem->size + realsize + 1;
+        mem->reserved = want;
     }
 
     memcpy(&(mem->memory[mem->size]), contents, realsize);
@@ -270,10 +289,14 @@ long get_data_from_url_with_session(void **ptr_session, char *url, char **out, s
         curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, session->speed_time);
     }
 
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT_SEC);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
     /* curl_easy_setopt(c, CURLOPT_FRESH_CONNECT, 1);*/
-    /* enable all supported built-in compressions */
-    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    /* Compression only for playlists: segments and keys are binary (nothing
+     * to gain), and a Range request answered with a compressed body would
+     * apply the range to the compressed bytes. NULL switches it off again on
+     * a reused handle. */
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, type == STRING ? "" : NULL);
 
     if (session->user_agent) {
         curl_easy_setopt(c, CURLOPT_USERAGENT, session->user_agent);

@@ -562,7 +562,8 @@ int main(int argc, char *argv[])
             if (media_playlist.is_endlist) {
                 ret = download_hls(&out_ctx, &media_playlist, &audio_media_playlist, resume);
             } else {
-                ret = download_live_hls(&out_ctx, &media_playlist);
+                ret = download_live_hls(&out_ctx, &media_playlist,
+                          audio_media_playlist.first_media_segment ? &audio_media_playlist : NULL);
             }
             /* the last buffered bytes are written here - a full disk shows up
              * now, not in the segment writes */
@@ -572,6 +573,7 @@ int main(int argc, char *argv[])
             }
         }
         free(resume);
+        fill_key_value_cleanup();
         return ret ? 1 : 0;
     }
 

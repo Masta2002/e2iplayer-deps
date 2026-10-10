@@ -333,6 +333,11 @@ static bool parse_pmt(const uint8_t *data, pmt_data_t *pmt)
     const uint8_t *bufp = data;
     ts_packet_t packed;
 
+    /* the component list describes this PMT only - a parse into a pmt_data_t
+     * that held an earlier PMT (merge re-done after a discontinuity, a failed
+     * attempt on another packet) must not add to the old entries */
+    pmt->component_num = 0;
+
     parse_ts_packet(bufp, &packed);
 
     if (packed.continuity != 0)
@@ -893,8 +898,9 @@ static size_t merge_with_raw_audio(merge_context_t *context, const uint8_t *pdat
         }
         else
         {
+            /* the caller writes the video alone */
             MSG_ERROR("RAW audio stream: codec not supported!\n");
-            exit(1);
+            return 0;
         }
         return do_merge_with_raw_audio(context, pdata1, size1, ptr, size2, dts, audiotype);
     }
@@ -1005,6 +1011,13 @@ static size_t merge_ts_packets(merge_context_t *context, const uint8_t *pdata1, 
         }
     }
     return ret;
+}
+
+void merge_context_reset(merge_context_t *context)
+{
+    write_ctx_t *out = context->out;
+    memset(context, 0x00, sizeof(*context));
+    context->out = out;
 }
 
 size_t merge_packets(merge_context_t *context, const uint8_t *pdata1, uint32_t size1, const uint8_t *pdata2, uint32_t size2)
