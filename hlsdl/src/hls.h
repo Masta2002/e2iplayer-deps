@@ -45,6 +45,7 @@ typedef struct hls_media_segment {
     int sequence_number;
     bool is_map;
     bool discontinuity;   /* an EXT-X-DISCONTINUITY precedes this segment */
+    int encryptiontype;   /* ENC_* of the EXT-X-KEY in force for this segment */
     uint64_t duration_ms;
     struct enc_aes128 enc_aes;
     struct hls_media_segment *next;
@@ -62,8 +63,9 @@ typedef struct hls_media_playlist {
     uint64_t target_duration_ms;
     uint64_t total_duration_ms;
     bool is_endlist;
-    bool encryption;
-    int encryptiontype;
+    bool encryption;               /* any EXT-X-KEY other than METHOD=NONE */
+    int encryptiontype;            /* the last method other than NONE */
+    int current_encryptiontype;    /* method while parsing, NONE included */
     int media_type;                /* MEDIA_TYPE_*, detected from the first segment */
     int discontinuity_sequence;    /* EXT-X-DISCONTINUITY-SEQUENCE */
     int first_media_sequence;

@@ -15,7 +15,7 @@ OE/OpenATV feed recipe.
 
 **Component versions** (bumped by hand alongside each component's own version string)
 
-[![hlsdl](https://img.shields.io/badge/hlsdl-v0.34-blue)](hlsdl/)
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.35-blue)](hlsdl/)
 [![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
 [![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
@@ -74,9 +74,17 @@ Download:       f4mdump "/path/to/wget [extra params]" "http://url.to/Manifest.f
 
 Downloads VOD and live HLS (`.m3u8`) streams to a single file. Handles
 MPEG-2 Transport Stream and fragmented MP4 / CMAF segments, `EXT-X-MAP`
-initialization segments (fMP4 and TS), `EXT-X-BYTERANGE`, discontinuities,
-AES-128 / SAMPLE-AES decryption, and TS segments disguised as images (an image
-header in front of the MPEG-TS data is cut off).
+initialization segments (fMP4 and TS; a repeated map is written once, a new
+one after a discontinuity also in live streams), `EXT-X-BYTERANGE`, discontinuities,
+AES-128 / SAMPLE-AES decryption (each segment with the key, IV and method -
+including `METHOD=NONE` - in force where it stands), and TS segments disguised
+as images (an image header in front of the MPEG-TS data is cut off).
+`EXT-X-KEY` and `EXT-X-MAP` attributes may come in any order. A segment that
+cannot be fetched (an empty body counts as failed), decrypted or written fails
+a VOD download (exit code 1, resumable with `-R`), as does an init segment
+whose response does not match its `BYTERANGE`; with `-I` a VOD download skips
+segments that cannot be fetched (decryption and write errors stay fatal). A live download skips a
+segment it cannot fetch or decrypt and stops when the output cannot be written.
 
 Requires `libcurl` and `libcrypto`.
 
@@ -114,6 +122,7 @@ Windows:  hlsdl/msvc/BUID_WINDOWS.txt
 -e ... Set refresh delay in seconds.
 -r ... Set max retries at open.
 -w ... Set max download segment retries.
+-I ... Skip VOD segments that still fail after the retries (the output has gaps; not with -R).
 -a ... Set additional url to the audio media playlist.
 -c ... Treat HTTP 206 as 200 even without a range request.
 ```

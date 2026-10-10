@@ -247,6 +247,13 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    /* The resume sidecar counts written segments and bytes; after a skipped
+     * segment a later -R run could not tell the gap from the finished part. */
+    if (hls_args.resume && hls_args.ignore_download_errors) {
+        MSG_ERROR("-R and -I cannot be combined.\n");
+        return 1;
+    }
+
     MSG_DBG("Loglevel: %d\n", hls_args.loglevel);
 
     curl_global_init(CURL_GLOBAL_ALL);
@@ -296,8 +303,9 @@ int main(int argc, char *argv[])
             int height, maxheight = 0;
             hls_media_playlist_t *me;
             for (me = master_playlist.media_playlist; me; me = me->next) {
+                /* a variant without RESOLUTION must not end the search */
                 if (sscanf(me->resolution, "%dx%d", &width, &height) < 2)
-                    break;
+                    continue;
                 if (width > hls_args.maxwidth && hls_args.maxwidth != -1)
                     continue;
                 if (height > hls_args.maxheight && hls_args.maxheight != -1)
@@ -369,7 +377,9 @@ int main(int argc, char *argv[])
 
             if (has_audio_playlist) {
                 // print hls master playlist
-                int audio_choice = 0;
+                /* -1 = nothing picked yet; 0 is a valid index (the first
+                 * entry) */
+                int audio_choice = -1;
                 int i = 1;
 
                 if (!selected_audio) {
@@ -392,7 +402,7 @@ int main(int argc, char *argv[])
                         }
                     }
 
-                    if (audio_choice == 0) {
+                    if (audio_choice < 0) {
                         audio = master_playlist.audio;
                         i = 0;
                         while (audio) {
@@ -554,7 +564,12 @@ int main(int argc, char *argv[])
             } else {
                 ret = download_live_hls(&out_ctx, &media_playlist);
             }
-            fclose(out_file);
+            /* the last buffered bytes are written here - a full disk shows up
+             * now, not in the segment writes */
+            if (fclose(out_file)) {
+                MSG_ERROR("Could not finish writing output file.\n");
+                ret = 1;
+            }
         }
         free(resume);
         return ret ? 1 : 0;
