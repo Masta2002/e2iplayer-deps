@@ -15,7 +15,7 @@ OE/OpenATV feed recipe.
 
 **Component versions** (bumped by hand alongside each component's own version string)
 
-[![hlsdl](https://img.shields.io/badge/hlsdl-v0.35-blue)](hlsdl/)
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.36-blue)](hlsdl/)
 [![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
 [![cmdwrap](https://img.shields.io/badge/cmdwrap-2-blue)](cmdwrap/)
@@ -85,6 +85,9 @@ a VOD download (exit code 1, resumable with `-R`), as does an init segment
 whose response does not match its `BYTERANGE`; with `-I` a VOD download skips
 segments that cannot be fetched (decryption and write errors stay fatal). A live download skips a
 segment it cannot fetch or decrypt and stops when the output cannot be written.
+A separate audio rendition (`EXT-X-MEDIA TYPE=AUDIO` or `-a`, TS or packed
+audio with an ID3 timestamp) is muxed into TS output for VOD and live streams;
+with fMP4 the video track is written alone.
 
 Requires `libcurl` and `libcrypto`.
 
@@ -103,7 +106,7 @@ Windows:  hlsdl/msvc/BUID_WINDOWS.txt
 -H ... Choose largest height lower or equal than this.
 -A ... Select audio language.
 -v ... Verbose more information.
--q ... Print less to the console.
+-q ... Print less to the console (status lines, errors and warnings; -qq: nothing).
 -o ... Choose name of output file ("-" alias for stdout).
 -f ... Force overwriting the output file.
 -R ... Resume an interrupted VOD download (keeps a <output>.hlsdl.resume sidecar).
@@ -123,7 +126,7 @@ Windows:  hlsdl/msvc/BUID_WINDOWS.txt
 -r ... Set max retries at open.
 -w ... Set max download segment retries.
 -I ... Skip VOD segments that still fail after the retries (the output has gaps; not with -R).
--a ... Set additional url to the audio media playlist.
+-a ... Set additional url to the audio media playlist (VOD and live, TS only).
 -c ... Treat HTTP 206 as 200 even without a range request.
 ```
 

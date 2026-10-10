@@ -22,7 +22,7 @@ struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.35\n");
+    printf("hlsdl v0.36\n");
     printf("(c) 2017-2026 @selsta, samsamsam@o2.pl\n");
     printf("Usage: %s [options] url\n\n"
            "-b ... Automatically choose the best quality.\n"
@@ -40,7 +40,7 @@ static void print_help(const char *filename)
            "-R ... Resume an interrupted VOD download (keeps a <output>.hlsdl.resume sidecar).\n"
            "-F ... Force ignore detection of DRM.\n"
            "-K ... Force AES key value (hexstring)\n"
-           "-q ... Print less to the console.\n"
+           "-q ... Print less to the console (status lines, errors and warnings; -qq: nothing).\n"
            "-d ... Print the openssl decryption command.\n"
            "-t ... Print the links to the .ts files.\n"
            "-s ... Set live start offset in seconds.\n"
@@ -49,7 +49,7 @@ static void print_help(const char *filename)
            "-r ... Set max retries at open.\n"
            "-w ... Set max download segment retries.\n"
            "-I ... Skip VOD segments that still fail after the retries (the output has gaps; not with -R).\n"
-           "-a ... Set additional url to the audio media playlist.\n"
+           "-a ... Set additional url to the audio media playlist (VOD and live, TS only).\n"
            "-c ... Treat HTTP code 206 as 200 even if request was made without range header.\n"
            "-C ... the file name of file holding cookie data in the old Netscape / Mozilla cookie data format.\n", filename);
     exit(0);

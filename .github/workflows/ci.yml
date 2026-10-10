@@ -246,6 +246,245 @@ jobs:
           cat av.txt
           grep -q video av.txt
           grep -q audio av.txt
+      - name: fixture - TS video + packed audio (ID3 + raw AAC) playlist
+        run: |
+          set -eux
+          cd fx
+          # Packed audio: raw ADTS frames behind an ID3 tag whose PRIV frame
+          # carries the 90 kHz start timestamp. find_first_ts_packet() finds no
+          # TS packets in it, so the audio used to be dropped without a word.
+          ffmpeg -v error -f lavfi -i sine=f=440:d=3 -c:a aac -ar 44100 -f adts packed_src.aac
+          nseg=$(grep -c '\.ts$' vplaylist.m3u8)
+          python3 - "$nseg" <<'EOF'
+          import struct, sys
+          n = int(sys.argv[1])
+          data = open('packed_src.aac', 'rb').read()
+          frames, i = [], 0
+          while i + 7 <= len(data):
+              assert data[i] == 0xFF and (data[i + 1] & 0xF0) == 0xF0
+              flen = ((data[i + 3] & 3) << 11) | (data[i + 4] << 3) | (data[i + 5] >> 5)
+              frames.append(data[i:i + flen])
+              i += flen
+          per = -(-len(frames) // n)
+          owner = b'com.apple.streaming.transportStreamTimestamp\x00'
+          lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:1', '#EXT-X-MEDIA-SEQUENCE:0']
+          for s in range(n):
+              chunk = frames[s * per:(s + 1) * per]
+              ts = 126000 + s * per * 1024 * 90000 // 44100
+              body = owner + struct.pack('>Q', ts)
+              frame = b'PRIV' + struct.pack('>I', len(body)) + b'\x00\x00' + body
+              tag = b'ID3\x04\x00\x00' + bytes([0, 0, 0, len(frame)]) + frame
+              open('p%d.aac' % s, 'wb').write(tag + b''.join(chunk))
+              lines += ['#EXTINF:1.0,', 'p%d.aac' % s]
+          lines.append('#EXT-X-ENDLIST')
+          open('packed.m3u8', 'w').write('\n'.join(lines) + '\n')
+          EOF
+          cat packed.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -a packed.m3u8 -o out_packed.ts vplaylist.m3u8
+          ffprobe -v error -show_entries stream=codec_type,codec_name -of csv=p=0 out_packed.ts | sort -u > packed.txt
+          cat packed.txt
+          grep -q video packed.txt
+          grep -q 'aac,audio' packed.txt
+          # the audio frames have to be readable, not only announced in the PMT
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_packed.ts | head -1)
+          test "$apk" -gt 50
+      - name: fixture - live TS video + separate audio playlist
+        run: |
+          set -eux
+          cd fx
+          # download_live_hls() used to take the video playlist only - a live
+          # stream with a separate audio rendition came out without sound
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' vplaylist.m3u8 > vlive.m3u8
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' aplaylist.m3u8 > alive.m3u8
+          python3 -m http.server 8202 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8202/vlive.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../hlsdl/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8202/alive.m3u8" \
+                 -o out_live_av.ts "http://127.0.0.1:8202/vlive.m3u8" 2>live_av.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' live_av.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive.m3u8
+          printf '#EXT-X-ENDLIST\n' >> alive.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat live_av.log
+          test "$rc" -eq 0
+          grep -q '"d_t":"live"' live_av.log
+          ! grep -q 'No audio for segment' live_av.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_live_av.ts | sort -u > live_av.txt
+          cat live_av.txt
+          grep -q video live_av.txt
+          grep -q audio live_av.txt
+          apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_live_av.ts | head -1)
+          test "$apk" -gt 20
+      - name: fixture - live audio window one segment ahead of the video
+        run: |
+          set -eux
+          cd fx
+          # The audio playlist is fetched after the video one; when the live
+          # window has moved on by a segment in between, the numbering is
+          # still the same: video 0..1, audio 1..2 here. Pairing must stay
+          # N <-> N: segment 0 has no audio (it already left the audio
+          # window), 1 has. Lining up the live edges instead (N <-> N+1) put
+          # every segment one segment out of sync, without any warning.
+          python3 - <<'EOF'
+          def entries(name):
+              head, segs, lines, i = [], [], open(name).read().split('\n'), 0
+              while i < len(lines):
+                  l = lines[i]
+                  if l.startswith('#EXTINF'):
+                      segs.append((l, lines[i + 1]))
+                      i += 2
+                      continue
+                  if l and not l.startswith(('#EXT-X-ENDLIST', '#EXT-X-MEDIA-SEQUENCE', '#EXT-X-PLAYLIST-TYPE')):
+                      head.append(l)
+                  i += 1
+              return head, segs
+          def write(name, head, seq, segs):
+              body = head + ['#EXT-X-MEDIA-SEQUENCE:%d' % seq] + [x for s in segs for x in s]
+              open(name, 'w').write('\n'.join(body) + '\n')
+          vh, vs = entries('vplaylist.m3u8')
+          ah, as_ = entries('aplaylist.m3u8')
+          assert len(vs) >= 3 and len(as_) >= 3
+          write('vlive_behind.m3u8', vh, 0, vs[0:2])
+          write('alive_ahead.m3u8', ah, 1, as_[1:3])
+          EOF
+          cat vlive_behind.m3u8 alive_ahead.m3u8
+          python3 -m http.server 8203 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8203/vlive_behind.m3u8 && break
+            sleep 0.5
+          done
+          timeout 60 ../hlsdl/hlsdl -v -f -s 30 -e 1 -a "http://127.0.0.1:8203/alive_ahead.m3u8" \
+                 -o out_ahead.ts "http://127.0.0.1:8203/vlive_behind.m3u8" 2>ahead.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' ahead.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive_behind.m3u8
+          printf '#EXT-X-ENDLIST\n' >> alive_ahead.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat ahead.log
+          test "$rc" -eq 0
+          ! grep -q 'numbered apart' ahead.log
+          grep -q 'No audio for segment 0 ' ahead.log
+          ! grep -q 'No audio for segment 1 ' ahead.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_ahead.ts | sort -u | grep -q audio
+      - name: fixture - live audio that cannot be fetched is given up, the video goes on
+        run: |
+          set -eux
+          cd fx
+          # every audio segment answers 404: after 3 misses the audio track
+          # (and its refresh thread, mid-download) is stopped, the video is
+          # written alone and hlsdl still ends normally at the ENDLIST
+          sed 's/^a\([0-9]*\)\.ts$/gone\1.ts/' alive.m3u8 | sed '/#EXT-X-ENDLIST/d' > alive_gone.m3u8
+          sed '/#EXT-X-ENDLIST/d' vlive.m3u8 > vlive_gone.m3u8
+          cat alive_gone.m3u8
+          python3 -m http.server 8204 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8204/vlive_gone.m3u8 && break
+            sleep 0.5
+          done
+          timeout 90 ../hlsdl/hlsdl -f -s 30 -e 1 -a "http://127.0.0.1:8204/alive_gone.m3u8" \
+                 -o out_gone.ts "http://127.0.0.1:8204/vlive_gone.m3u8" 2>gone.log &
+          dl=$!
+          for _ in $(seq 120); do
+            grep -q 'keeps failing' gone.log && break
+            sleep 0.5
+          done
+          sleep 1
+          printf '#EXT-X-ENDLIST\n' >> vlive_gone.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat gone.log
+          test "$rc" -eq 0
+          grep -q 'keeps failing' gone.log
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_gone.ts | sort -u > gone.txt
+          cat gone.txt
+          grep -q video gone.txt
+          ! grep -q audio gone.txt
+      - name: fixture - TS audio with an ID3 tag in front, PIDs changing at a discontinuity
+        run: |
+          set -eux
+          cd fx
+          # audio packets over all audio streams (a PID change makes a second
+          # one); ffprobe lists a stream once per program too, hence sort -u
+          pk() { ffprobe -v error -select_streams a -count_packets -show_entries stream=index,nb_read_packets -of csv=p=0 "$1" | sort -u | awk -F, '{s += $2} END {print s + 0}'; }
+          # An ID3 timed-metadata tag in front of TS audio is no packed audio:
+          # it must still be merged as TS
+          python3 - <<'EOF'
+          import struct
+          body = b'com.example.meta\x00' + b'x' * 8
+          frame = b'PRIV' + struct.pack('>I', len(body)) + b'\x00\x00' + body
+          tag = b'ID3\x04\x00\x00' + bytes([0, 0, 0, len(frame)]) + frame
+          src = open('aplaylist.m3u8').read()
+          for l in src.split('\n'):
+              if l.endswith('.ts'):
+                  open('id3' + l, 'wb').write(tag + open(l, 'rb').read())
+          open('id3a.m3u8', 'w').write('\n'.join(('id3' + l) if l.endswith('.ts') else l for l in src.split('\n')))
+          EOF
+          timeout 60 ../hlsdl/hlsdl -f -a id3a.m3u8 -o out_id3ts.ts vplaylist.m3u8 2>id3ts.log
+          cat id3ts.log
+          ! grep -q 'Could not merge' id3ts.log
+          test "$(pk out_id3ts.ts)" -eq "$(pk out_av.ts)"
+          # After a discontinuity the TS PIDs / PMT change (ad break): the
+          # merge has to work its PMT out again, or the audio after it is lost
+          ffmpeg -v error -f lavfi -i testsrc=d=1:s=128x72 -c:v mpeg2video \
+                 -mpegts_pmt_start_pid 0x1100 -mpegts_start_pid 0x130 -f mpegts vx.ts
+          ffmpeg -v error -f lavfi -i sine=f=880:d=1 -c:a mp2 \
+                 -mpegts_pmt_start_pid 0x1200 -mpegts_start_pid 0x140 -f mpegts ax.ts
+          hdr='#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n'
+          { printf "$hdr"; printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nvx.ts\n#EXT-X-ENDLIST\n'; } > vdisc.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nax.ts\n#EXT-X-ENDLIST\n'; } > adisc.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-ENDLIST\n'; } > vone.m3u8
+          { printf "$hdr"; printf '#EXTINF:1.0,\na0.ts\n#EXT-X-ENDLIST\n'; } > aone.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -a aone.m3u8 -o out_one.ts vone.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -a adisc.m3u8 -o out_adisc.ts vdisc.m3u8
+          one=$(pk out_one.ts); both=$(pk out_adisc.ts); ax=$(pk ax.ts)
+          echo "one=$one both=$both ax=$ax"
+          # the audio of the second part is in the file, not just the first
+          test "$both" -ge $((one + ax * 3 / 4))
+          # Many discontinuities, and the audio PMT layout changes with them
+          # (a language descriptor makes its ES_info longer): every re-parse
+          # has to start from a clean PMT - stale components used to pile up
+          # until hlsdl exited ("Components table to small") or wrote past
+          # its buffer.
+          ffmpeg -v error -f lavfi -i sine=f=660:d=1 -c:a mp2 -metadata:s:a:0 language=deu \
+                 -mpegts_pmt_start_pid 0x1300 -mpegts_start_pid 0x150 -f mpegts al.ts
+          {
+            printf "$hdr"
+            for i in 1 2 3; do
+              printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nvx.ts\n#EXT-X-DISCONTINUITY\n'
+            done
+            printf '#EXTINF:1.0,\nv0.ts\n#EXT-X-ENDLIST\n'
+          } > vmany.m3u8
+          {
+            printf "$hdr"
+            for i in 1 2 3; do
+              printf '#EXTINF:1.0,\na0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1.0,\nal.ts\n#EXT-X-DISCONTINUITY\n'
+            done
+            printf '#EXTINF:1.0,\na0.ts\n#EXT-X-ENDLIST\n'
+          } > amany.m3u8
+          timeout 60 ../hlsdl/hlsdl -f -a amany.m3u8 -o out_many.ts vmany.m3u8 2>many.log
+          ! grep -q 'Could not merge' many.log
+          many=$(pk out_many.ts); al=$(pk al.ts)
+          echo "many=$many one=$one al=$al"
+          test "$many" -ge $(( (4 * one + 3 * al) * 3 / 4 ))
       - name: fixture - AES-128 with EXT-X-MAP before EXT-X-KEY
         run: |
           set -eux
@@ -390,6 +629,14 @@ jobs:
             echo "hlsdl reported success for an unreachable segment" >&2
             exit 1
           fi
+          # -q (as e2iplayer runs it) still tells why; -qq is silent
+          timeout 30 ../hlsdl/hlsdl -q -w 0 -f -o out_broken.ts broken.m3u8 2>q.log || true
+          cat q.log
+          grep -q '^Error: ' q.log
+          grep -q '"error_code"' q.log
+          ! grep -q 'Downloading part' q.log
+          timeout 30 ../hlsdl/hlsdl -q -q -w 0 -f -o out_broken.ts broken.m3u8 2>qq.log || true
+          test ! -s qq.log
       - name: fixture - -I skips a segment that cannot be fetched
         run: |
           set -eux
