@@ -81,13 +81,18 @@ WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
     return realsize;
 }
 
+/* NULL when no memory or no curl handle could be had */
 void * init_http_session(void)
 {
-    struct http_session *session = malloc(sizeof(struct http_session));
-    CURL *c;
-    memset(session, 0x00, sizeof(struct http_session));
-    c = curl_easy_init();
-    session->handle = c;
+    struct http_session *session = calloc(1, sizeof(struct http_session));
+    if (!session) {
+        return NULL;
+    }
+    session->handle = curl_easy_init();
+    if (!session->handle) {
+        free(session);
+        return NULL;
+    }
     return session;
 }
 
@@ -243,7 +248,8 @@ long get_data_from_url_with_session(void **ptr_session, char *url, char **out, s
     chunk.reserved = 0;
     chunk.c = c;
 
-    char range_buff[22];
+    /* two full int64 values: "-9223372036854775808-9223372036854775807" */
+    char range_buff[42];
     char* range = NULL;
     if (range_size > -1) {
         snprintf(range_buff, sizeof(range_buff), "%"PRId64"-%"PRId64, range_offset, range_offset + range_size - 1);
@@ -306,23 +312,29 @@ long get_data_from_url_with_session(void **ptr_session, char *url, char **out, s
 
     if (res != CURLE_OK) {
         MSG_ERROR("curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-        if (http_code == 200) {
+        /* a transfer that broke off after a 206 is just as incomplete */
+        if (http_code == 200 || http_code == 206) {
             http_code = -(long)res;
         }
     } else {
-        if (type == STRING) {
-            *out = strdup(chunk.memory);
+        if (type == STRING || type == BINARY) {
+            /* Hand the (always NUL-terminated) receive buffer over instead of
+             * copying it - a segment would otherwise sit in memory twice. An
+             * image in front of the segment data (e.g. the 1x1 PNG described
+             * at https://laurentmeyer.medium.com/deep-dive-in-the-illegal-streaming-world-cd11fae63497)
+             * is cut off in hls.c (strip_disguise_prefix), which checks for the
+             * TS data behind it - not here. */
+            *out = chunk.memory;
+            chunk.memory = NULL;
         } else if (type == BINKEY) {
-            *out = malloc(KEYLEN);
-            *out = memcpy(*out, chunk.memory, KEYLEN);
-        } else if (type == BINARY) {
-            *out = malloc(chunk.size);
-            // hack to remove 1x1 png as seen e.g. here:
-            // https://laurentmeyer.medium.com/deep-dive-in-the-illegal-streaming-world-cd11fae63497
-            if (chunk.size > 16 && (chunk.memory[0] == 0x89 && chunk.memory[1] == 0x50 && chunk.memory[2] == 0x4E)) {
-                *out = memcpy(*out, chunk.memory + 16, chunk.size);
-            } else {
-                *out = memcpy(*out, chunk.memory, chunk.size);
+            /* a short key response must not be read as 16 bytes; the caller
+             * rejects the size */
+            *out = NULL;
+            if (chunk.size == KEYLEN) {
+                *out = malloc(KEYLEN);
+                if (*out) {
+                    memcpy(*out, chunk.memory, KEYLEN);
+                }
             }
         }
     }
@@ -365,28 +377,4 @@ void clean_http_session(void *ptr_session)
     }
 
     free(session);
-}
-
-size_t get_data_from_url(char *url, char **str, uint8_t **bin, int type, char **new_url)
-{
-    CURL *c = (CURL *)init_http_session();
-    size_t size;
-    char *out = NULL;
-    get_data_from_url_with_session(&c, url, &out, &size, type, new_url, -1, -1);
-
-    switch (type){
-    case STRING:
-        *str = out;
-        break;
-    case BINARY:
-    case BINKEY:
-        *bin = (uint8_t *)out;
-        break;
-    default:
-        break;
-    }
-
-    clean_http_session(c);
-
-    return size;
 }
