@@ -1452,6 +1452,16 @@ jobs:
           print("microdvd:", r)
           last = r["list"][-1]
           assert last["end"] > last["start"], "last cue ends before it starts"
+
+          # unknown tags: removed when their closing tag follows, kept as text
+          # otherwise - decided by the closing tag, not by stack garbage
+          def text(cue):
+              r = _subparser.parse("1\n00:00:01,000 --> 00:00:02,000\n" + cue + "\n\n", 0, 1, 1, 12, 138)
+              return r["list"][0]["text"].strip()
+          for _ in range(3):
+              assert text("a <c>b</c> c") == "a b c", text("a <c>b</c> c")
+              assert text("x <foo> y") == "x <foo> y", text("x <foo> y")
+              assert text("<i>it</i> <c>w</c>") == "it w", text("<i>it</i> <c>w</c>")
           PY
       - name: parsers never loop forever
         working-directory: e2isubparser
@@ -1508,7 +1518,7 @@ jobs:
               || { echo "README 'Component versions' badge for $1 is not $2" >&2; exit 1; }
           }
           check hlsdl        "$(grep -oE 'hlsdl v[0-9.]+' hlsdl/src/misc.c | head -1 | sed 's/hlsdl //')"
-          check e2isubparser "$(grep -oE '"[0-9]+\.[0-9]+"' e2isubparser/src/subparsermodule.c | head -1 | tr -d '"')"
+          check e2isubparser "$(grep -oE '"[0-9.]+"' e2isubparser/src/subparsermodule.c | head -1 | tr -d '"')"
           check lsdir        "$(grep -oE '"[0-9.]+"' lsdir/src/lsdir.c | head -1 | tr -d '"')"
           check cmdwrap      "$(grep -oE 'Version: [0-9.]+' cmdwrap/src/cmdwrap.c | grep -oE '[0-9.]+')"
           check f4mdump      "$(grep -oE 'F4MDump v[0-9.]+' f4mdump/src/main.cpp | sed 's/F4MDump //')"
