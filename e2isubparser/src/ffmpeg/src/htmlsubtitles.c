@@ -242,7 +242,9 @@ void ff_htmlmarkup_to_ass(void *log_ctx, char *dst, size_t dst_size, const char 
                     else 
                     {
                         unknown = 1;
-                        ; /*snprintf(tmp, sizeof(tmp), "</%s>", tagname);*/
+                        /* the closing tag searched for below - was commented out,
+                         * so strstr() compared against uninitialised stack data */
+                        snprintf(tmp, sizeof(tmp), "</%s>", tagname);
                     }
                     if (tag_close)
                     {
