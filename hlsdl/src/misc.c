@@ -8,6 +8,7 @@
 
 #ifndef _MSC_VER
 #include <unistd.h>
+#include <getopt.h>
 #else
 #include "..\msvc\win\getopt.h"
 #endif
@@ -22,7 +23,7 @@ struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.38\n");
+    printf("hlsdl v0.39\n");
     printf("(c) 2017-2026 @selsta, samsamsam@o2.pl\n");
     printf("Usage: %s [options] url\n\n"
            "-b ... Automatically choose the best quality (AV1 / Dolby Vision only when there is nothing else).\n"
@@ -57,10 +58,13 @@ static void print_help(const char *filename)
 
 int parse_argv(int argc, char * const argv[])
 {
+    /* getopt_long without long options: unlike plain getopt() of musl (the static
+     * feed builds) it also takes options behind the url, like glibc always did */
+    static const struct option no_long_options[] = { { NULL, 0, NULL, 0 } };
     int ret = 0;
     int c = 0;
     int custom_header_idx = 0;
-    while ( (c = getopt(argc, argv, "bH:W:A:vqbfRFK:ctdo:u:h:s:i:r:w:Ie:p:k:n:a:C:")) != -1)
+    while ( (c = getopt_long(argc, argv, "bH:W:A:vqbfRFK:ctdo:u:h:s:i:r:w:Ie:p:k:n:a:C:", no_long_options, NULL)) != -1)
     {
         switch (c)
         {
