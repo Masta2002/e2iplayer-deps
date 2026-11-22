@@ -23,7 +23,7 @@ struct hls_args hls_args;
 
 static void print_help(const char *filename)
 {
-    printf("hlsdl v0.39\n");
+    printf("hlsdl v0.40\n");
     printf("(c) 2017-2026 @selsta, samsamsam@o2.pl\n");
     printf("Usage: %s [options] url\n\n"
            "-b ... Automatically choose the best quality (AV1 / Dolby Vision only when there is nothing else).\n"

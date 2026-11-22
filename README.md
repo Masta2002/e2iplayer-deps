@@ -21,7 +21,7 @@ OE/OpenATV feed recipe.
 
 **Component versions** (bumped by hand alongside each component's own version string)
 
-[![hlsdl](https://img.shields.io/badge/hlsdl-v0.39-blue)](hlsdl/)
+[![hlsdl](https://img.shields.io/badge/hlsdl-v0.40-blue)](hlsdl/)
 [![e2isubparser](https://img.shields.io/badge/e2isubparser-0.9.1-blue)](e2isubparser/)
 [![lsdir](https://img.shields.io/badge/lsdir-1.0-blue)](lsdir/)
 [![cmdwrap](https://img.shields.io/badge/cmdwrap-2.0-blue)](cmdwrap/)
@@ -114,6 +114,9 @@ a VOD download (exit code 1, resumable with `-R`), as does an init segment
 whose response does not match its `BYTERANGE`; with `-I` a VOD download skips
 segments that cannot be fetched (decryption and write errors stay fatal). A live download skips a
 segment it cannot fetch or decrypt and stops when the output cannot be written.
+A live playlist answering 404 / 410 ten refreshes in a row counts as the end of
+the stream: the queued segments are written and hlsdl exits 0, as after
+`EXT-X-ENDLIST`.
 A separate audio rendition (`EXT-X-MEDIA TYPE=AUDIO` or `-a`, TS or packed
 audio with an ID3 timestamp) is muxed into TS output for VOD and live streams;
 with fMP4 the video track is written alone.

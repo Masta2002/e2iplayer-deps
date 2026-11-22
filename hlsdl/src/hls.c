@@ -1788,6 +1788,8 @@ static void *hls_playlist_update_thread(void *arg)
     /* refreshes in a row that failed / that went back in media sequence */
     int failed_refreshes = 0;
     int backward_refreshes = 0;
+    /* refreshes in a row answered 404 / 410 (HLSDL_LIVE_GONE_REFRESHES) */
+    int gone_refreshes = 0;
     /* me->url is where the last refresh was redirected to; when that keeps
      * failing (an expired token in the redirect target) the original url is
      * asked again, as on the first request */
@@ -1822,6 +1824,7 @@ static void *hls_playlist_update_thread(void *arg)
         new_me.orig_url = strdup(me->orig_url ? me->orig_url : list_url);
         if (200 == http_code && 0 == media_playlist_get_links(&new_me)) {
             failed_refreshes = 0;
+            gone_refreshes = 0;
             if (use_orig_url && new_me.url) {
                 char *url = strdup(new_me.url);
                 if (url) {
@@ -1934,6 +1937,20 @@ static void *hls_playlist_update_thread(void *arg)
             if (++failed_refreshes >= 3 && !use_orig_url && me->orig_url && strcmp(me->orig_url, me->url)) {
                 MSG_WARNING("The playlist keeps failing - asking the original url again.\n");
                 use_orig_url = true;
+            }
+            gone_refreshes = (404 == http_code || 410 == http_code) ? gone_refreshes + 1 : 0;
+            if (gone_refreshes >= HLSDL_LIVE_GONE_REFRESHES) {
+                /* ended like an ENDLIST: the segments still queued are
+                 * written, then the download finishes normally (exit 0) */
+                MSG_WARNING("The live playlist is gone (http_code[%d] %d times in a row) - the stream has ended.\n",
+                            (int)http_code, gone_refreshes);
+                pthread_mutex_lock(media_playlist_mtx);
+                me->is_endlist = true;
+                is_endlist = true;
+                pthread_cond_signal(media_playlist_empty_cond);
+                pthread_mutex_unlock(media_playlist_mtx);
+                media_playlist_cleanup(&new_me);
+                break;
             }
             clean_http_session(session);
             sleep(1);

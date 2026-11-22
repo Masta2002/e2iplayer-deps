@@ -31,6 +31,9 @@ extern "C" {
 #define HLSDL_MAX_REFRESH_DELAY_SEC    5
 #define HLSDL_LIVE_START_OFFSET_SEC  120
 #define HLSDL_LIVE_DURATION         (-1)
+/* a live playlist answering 404 / 410 this many refreshes in a row is gone:
+ * the stream has ended (BongaCams: the model went offline) */
+#define HLSDL_LIVE_GONE_REFRESHES     10
 #define HLSDL_MAX_RETRIES             30
 #define HLSDL_OPEN_MAX_RETRIES         3
 

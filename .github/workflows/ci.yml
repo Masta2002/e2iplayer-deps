@@ -358,6 +358,35 @@ jobs:
           grep -q audio live_av.txt
           apk=$(ffprobe -v error -select_streams a -count_packets -show_entries stream=nb_read_packets -of csv=p=0 out_live_av.ts | head -1)
           test "$apk" -gt 20
+      - name: fixture - live playlist gone (404) ends the download
+        run: |
+          set -eux
+          cd fx
+          # the model of a live cam goes offline: the playlist answers 404 for
+          # good. hlsdl used to ask for it forever; now ten 404 in a row end
+          # the download like an ENDLIST (exit 0, the file is kept)
+          sed '/#EXT-X-ENDLIST/d;/#EXT-X-PLAYLIST-TYPE/d' vplaylist.m3u8 > vgone.m3u8
+          python3 -m http.server 8211 &
+          srv=$!
+          for _ in $(seq 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8211/vgone.m3u8 && break
+            sleep 0.5
+          done
+          timeout 120 ../hlsdl/hlsdl -f -s 30 -e 1 -o out_gone.ts "http://127.0.0.1:8211/vgone.m3u8" 2>gone.log &
+          dl=$!
+          for _ in $(seq 40); do
+            grep -q 'Downloading part 1' gone.log && break
+            sleep 0.5
+          done
+          rm vgone.m3u8
+          rc=0
+          wait $dl || rc=$?
+          kill $srv 2>/dev/null || true
+          cat gone.log
+          test "$rc" -eq 0
+          grep -q 'the stream has ended' gone.log
+          test "$(grep -c 'Fail to update playlist' gone.log)" -eq 10
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 out_gone.ts | grep -q video
       - name: fixture - live audio window one segment ahead of the video
         run: |
           set -eux
